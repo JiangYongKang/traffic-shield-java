@@ -1,0 +1,161 @@
+# traffic-shield-java
+
+本地可验证的请求防护与限流能力（内存状态模拟网关）。所有入口共用同一个无状态判定编排方法，
+因此正常流量、可疑流量与超限流量在不同入口下都会得到**一致且可解释**的结论。
+
+- 安全检测：SQL 注入、XSS、命令注入、路径穿越、异常编码，命中即拒绝并返回稳定、可区分的原因码。
+- 按来源 + 规则限流：固定时间窗口计数，突发/并发下计数精确，不丢计数、不重复放行、不提前解除。
+- 规则原子更新：整表校验通过后一次性发布，更新期间不混合新旧规则；非法规则被拒绝，旧规则保留。
+- 统计查询：命中/拒绝/限流计数在同一锁下采样，`total = 放行 + 安全拒绝(各类之和) + 限流` 恒成立。
+- 测试覆盖正常、可疑、并发超限与更新并发场景，日志打印请求特征与判定依据。
+
+## 1. 判定结论（统一响应体）
+
+所有入口返回同一结构：
+
+| 字段 | 含义 |
+| --- | --- |
+| `allowed` | 是否放行 |
+| `status` | `ALLOW` / `REJECT` |
+| `reason` | 稳定原因码，见下表 |
+| `ruleId` | 命中的规则 ID（放行时为 null） |
+| `message` | 人类可读的判定依据（含命中文段、原始/解码视图、匹配片段） |
+| `retryAfterSeconds` | 仅限流：建议多少秒后重试 |
+| `rulesVersion` | 判定时生效的规则版本 |
+| `source` / `path` | 来源与路径，便于自解释 |
+
+### 拒绝原因码（稳定、可区分）
+
+| reason | 触发条件 | HTTP 状态（网关入口） |
+| --- | --- | --- |
+| `SQL_INJECTION` | SQL 注入签名（注释符、UNION、堆叠/布尔注入、危险关键字等） | 403 |
+| `XSS` | `<script>`、事件属性、`javascript:`、危险标签等 | 403 |
+| `COMMAND_INJECTION` | shell 连接符 + 命令、命令替换、危险系统命令 | 403 |
+| `PATH_TRAVERSAL` | `../`、`..\`、敏感系统路径等（含 URL 解码后识别） | 403 |
+| `SUSPICIOUS_ENCODING` | 畸形百分号、双重编码危险片段、空字节、`%uXXXX`、UTF-8 超长编码 | 403 |
+| `RATE_LIMITED` | 超过来源在规则窗口内的配额 | 429（带 `Retry-After`） |
+| `ALLOWED` | 未命中安全规则且未超限 | 200 |
+
+## 2. 检测规则
+
+安全检测对 `path`、`query`、业务可写请求头（`Referer` 与 `X-*`，不含 `Accept`/`User-Agent`/`Cookie`
+等基础设施头）、`body` 依次扫描，分两个阶段：
+
+1. **异常编码（内置 ENC-* 检查）**
+   - `ENC-MALFORMED-PERCENT`：URL 字段中 `%` 后不是两位十六进制（仅 path/query 判定，避免误伤 "100% 满意" 类正文）；
+   - `ENC-DOUBLE-ENCODED`：双重编码危险片段（如 `%252e%252e%252f`）；
+   - `ENC-NULL-BYTE`：`%00` / 空字节；
+   - `ENC-PERCENT-U`：非标准 `%uXXXX`（仅 URL 字段）；
+   - `ENC-OVERLONG-UTF8`：UTF-8 超长编码如 `%c0%af`（仅 URL 字段）。
+2. **签名匹配（可更新的正则规则表，大小写不敏感 + DOTALL）**
+   在原始文本与 URL 解码后文本上各匹配一次，按规则声明顺序取**首个命中**。
+   默认规则 17 条，ID 形如 `SQL-00x` / `XSS-00x` / `CMD-00x` / `PATH-00x` / `ENC-*`，
+   完整内容见 `security/DefaultRules.java`。规则设计保守，正常查询、合法百分号编码、
+   `2-1`、`10:00`、`*/*` 等正常文本均不会被误拦。
+
+> 说明：路径字面量中的 `../` 会被 Tomcat 等容器在到达应用前归一化，因此真实的穿越特征通常
+> 出现在 query/body（如文件名参数），本系统在这些位置（解码前后）稳定识别。
+
+## 3. 限流语义
+
+- 维度：**(来源, 限流规则)** 各自独立的固定时间窗口；规则按路径的 Ant 模式（如 `/**`）匹配，
+  一个请求只被第一条匹配的规则计数。
+- 窗口：从该来源该规则的首个请求时刻起算 `windowSeconds` 秒；窗口内第 `1..limit` 个请求放行，
+  第 `limit+1` 个起返回 `RATE_LIMITED`；**窗口未结束绝不提前解除**，越过边界后下一个请求开启新窗口。
+- 并发：每个窗口用 `AtomicLong` 计数（自增即计数、不回滚），前 `limit` 次自增必然放行、其后必然拒绝；
+  窗口切换用 CAS 替换窗口对象、竞争失败取最新窗口重试，保证 500 并发/配额 50 时精确放行 50。
+- 来源识别：优先取 `traffic-shield.source-header` 指定的头（`X-Forwarded-For` 取第一个），
+  缺省回退对端 IP；JSON 入口可显式传 `source`。
+- 可重试：429 响应带 `Retry-After` 头与体内 `retryAfterSeconds`（距窗口结束的秒数，最少 1）。
+- 内存：过期窗口由定时任务（默认每 10s）清理。
+- 顺序：**先安全检测后限流**，被安全拒绝的请求不消耗限流配额。
+
+## 4. 规则更新与一致性
+
+- 规则与编译结果打包为不可变节点 `ActiveRules`，通过一个 `AtomicReference` 原子发布；
+  一次请求只读取一次该引用，安全规则、限流规则、版本号来自同一对象，**更新期间不可能新旧混用**
+  （测试中 200 轮更新 + 16000 次并发判定 0 违例）。
+- 更新是"整表替换"：`securityRules` / `rateLimitRules` 字段为 `null` 表示该部分不变，
+  非 `null` 表示整表替换。任何一条规则非法（空 ID、重复 ID、非法 category、非法正则、
+  非正的 limit/windowSeconds 等）都会整体拒绝并返回 400，旧规则与版本保持不变。
+
+## 5. 配置项（`src/main/resources/application.properties`）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `traffic-shield.enabled` | `true` | 安全检测总开关（关闭后仅限流） |
+| `traffic-shield.default-limit` | `10` | 内置默认限流规则的每窗口配额 |
+| `traffic-shield.default-window-seconds` | `10` | 内置默认限流窗口长度（秒） |
+| `traffic-shield.source-header` | `X-Forwarded-For` | 来源识别请求头 |
+| `traffic-shield.sweep-interval-seconds` | `10` | 过期限流窗口清理间隔（秒） |
+
+## 6. HTTP 接口
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `ANY /gateway/**` | 模拟网关入口：200 放行 / 403 安全拒绝 / 429 限流 |
+| `POST /shield/check` | JSON 检查入口，提交请求特征，始终返回 200，结论在响应体内 |
+| `GET /shield/rules` | 查询当前生效规则与版本 |
+| `PUT /shield/rules` | 原子更新规则（非法返回 400，旧规则保留） |
+| `GET /shield/stats` | 统计快照 |
+
+`/shield/check` 请求体示例：
+
+```json
+{ "method": "GET", "path": "/products", "query": "id=1 OR 1=1",
+  "headers": { "X-Trace": "t-1" }, "body": null, "source": "user-42" }
+```
+
+## 7. 本地验证
+
+```bash
+# 全部单测（21 个：正常/可疑/单线程限流/500并发/更新并发/双入口一致性/统计）
+mvn test
+
+# 启动应用
+mvn spring-boot:run
+```
+
+启动后：
+
+```bash
+B=http://localhost:8080
+
+# 正常 => 200 ALLOWED
+curl -s -H 'X-Forwarded-For: u1' "$B/gateway/api/orders?page=2"
+
+# SQL 注入 => 403 SQL_INJECTION
+curl -s -H 'X-Forwarded-For: u1' "$B/gateway/products?id=1%20OR%201=1"
+
+# 路径穿越（参数位）=> 403 PATH_TRAVERSAL
+curl -s -G -H 'X-Forwarded-For: u1' "$B/gateway/files" --data-urlencode 'name=../../etc/passwd'
+
+# 双重编码 => 403 SUSPICIOUS_ENCODING
+curl -s -H 'X-Forwarded-For: u1' "$B/gateway/files?name=%252e%252e%252fetc"
+
+# 突发限流（默认 10/10s）：前 10 次 200，之后 429 + Retry-After
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Forwarded-For: burst' "$B/gateway/api/x"
+done
+
+# JSON 检查入口（与网关入口结论一致）
+curl -s -X POST "$B/shield/check" -H 'Content-Type: application/json' \
+  -d '{"path":"/products","query":"id=1 OR 1=1","source":"u1"}'
+
+# 规则查询 / 原子更新 / 统计
+curl -s "$B/shield/rules"
+curl -s -X PUT "$B/shield/rules" -H 'Content-Type: application/json' \
+  -d '{"securityRules":[{"id":"CUSTOM-1","name":"自定义禁词","category":"XSS","pattern":"forbidden-token"}]}'
+curl -s "$B/shield/stats"
+```
+
+## 8. 代码结构
+
+```
+model/        请求/结论/规则/统计等不可变模型与稳定原因码枚举
+security/     默认规则库、规则校验与编译、无状态安全检测
+ratelimit/    按来源+规则的固定窗口并发安全限流器
+service/      ActiveRules 原子发布节点 + 编排服务（安全→限流→统计）
+config/       配置属性、Bean 装配与过期窗口清理调度
+web/          网关入口、JSON 检查入口、管理面接口与全局异常处理
+```
