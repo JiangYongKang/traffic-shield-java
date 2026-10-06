@@ -120,10 +120,24 @@ public final class SecurityInspector {
      * @return 首个命中的规则；未命中返回 null
      */
     public Hit inspect(List<CompiledRule> compiled, ShieldRequest request) {
+        return inspect(compiled, request, false);
+    }
+
+    /**
+     * 基于指定的编译规则快照对请求执行检测。
+     *
+     * @param skipSignatures 为 true 时跳过可配置签名规则（误拦例外场景），
+     *                       但内置的明显攻击编码检查（ENC-*）仍然执行
+     * @return 首个命中的规则；未命中返回 null
+     */
+    public Hit inspect(List<CompiledRule> compiled, ShieldRequest request, boolean skipSignatures) {
         Hit h;
-        // 1) 原始文本上的异常编码（内置 ENC-* 检查）
+        // 1) 原始文本上的异常编码（内置 ENC-* 检查）——不受误拦例外影响
         if ((h = scanEach(request, true, compiled)) != null) {
             return h;
+        }
+        if (skipSignatures) {
+            return null;
         }
         // 2) 原始文本 + 解码后文本上的规则签名匹配
         return scanEach(request, false, compiled);
