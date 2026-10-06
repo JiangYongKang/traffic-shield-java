@@ -1,6 +1,7 @@
 package com.github.highcumontoa.trafficshieldjava.service;
 
 import com.github.highcumontoa.trafficshieldjava.config.ShieldProperties;
+import com.github.highcumontoa.trafficshieldjava.model.AllowlistException;
 import com.github.highcumontoa.trafficshieldjava.model.DecisionReason;
 import com.github.highcumontoa.trafficshieldjava.model.RateLimitRule;
 import com.github.highcumontoa.trafficshieldjava.model.RuleSet;
@@ -9,6 +10,7 @@ import com.github.highcumontoa.trafficshieldjava.model.SecurityRule;
 import com.github.highcumontoa.trafficshieldjava.model.ShieldDecision;
 import com.github.highcumontoa.trafficshieldjava.model.ShieldRequest;
 import com.github.highcumontoa.trafficshieldjava.model.ShieldStats;
+import com.github.highcumontoa.trafficshieldjava.model.SourceTierRule;
 import com.github.highcumontoa.trafficshieldjava.ratelimit.RateLimiter;
 import com.github.highcumontoa.trafficshieldjava.security.DefaultRules;
 import com.github.highcumontoa.trafficshieldjava.security.IllegalRuleException;
@@ -28,14 +30,15 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * 流量防护编排服务：所有入口（HTTP 网关入口、JSON 检查入口）都经过此处，
  * 因此不同入口对同一请求特征必然得到一致且可解释的结论。
  *
- * <p>单次请求处理顺序：先安全检测，命中即拒绝（不消耗限流配额）；
- * 未命中再进行按来源/规则的限流计数；最后记录统计并返回结论。</p>
+ * <p>单次请求处理顺序：先安全检测（含误拦例外豁免），命中即拒绝（不消耗限流配额）；
+ * 未命中再进行限流计数：配置了来源分级档位时按首个命中档位计一次数，
+ * 未命中任何档位则回退普通限流规则；最后记录统计并返回结论。</p>
  *
- * <p>规则更新：先对整张新规则表完成全部校验与编译，再通过唯一的
- * {@link AtomicReference}&lt;{@link ActiveRules}&gt; 一次原子发布。处理请求时只读取一次
- * 该引用，安全规则、限流规则、版本号都来自同一个不可变对象，
- * 更新过程中不可能出现新旧规则混合判定；校验失败抛
- * {@link IllegalRuleException}，旧引用保持不变。</p>
+ * <p>规则更新：安全规则、限流规则、分级档位、误拦例外四个部分先完成全部校验与编译，
+ * 再通过唯一的 {@link AtomicReference}&lt;{@link ActiveRules}&gt; 一次原子发布。
+ * 处理请求时只读取一次该引用，四部分规则与版本号都来自同一个不可变对象，
+ * 更新过程中不可能出现新旧规则混合判定；任何一部分校验失败都抛
+ * {@link IllegalRuleException}，整次更新被拒绝，旧引用保持不变。</p>
  */
 @Service
 public class TrafficShieldService {
@@ -44,7 +47,7 @@ public class TrafficShieldService {
 
     private final ShieldProperties properties;
     private final SecurityInspector inspector = new SecurityInspector();
-    private final RateLimiter rateLimiter = new RateLimiter();
+    private final RateLimiter rateLimiter;
 
     /** 当前生效规则及其编译结果，唯一的原子发布点。 */
     private final AtomicReference<ActiveRules> active = new AtomicReference<>();
@@ -58,12 +61,14 @@ public class TrafficShieldService {
 
     public TrafficShieldService(ShieldProperties properties) {
         this.properties = properties;
+        this.rateLimiter = new RateLimiter(properties.getMaxStateEntries());
         RuleSet initial = new RuleSet(
                 DefaultRules.securityRules(),
                 List.of(DefaultRules.defaultRateLimitRule(
                         properties.getDefaultLimit(), properties.getDefaultWindowSeconds())),
                 1L);
-        active.set(new ActiveRules(initial, inspector.compile(initial.securityRules())));
+        active.set(new ActiveRules(initial, inspector.compile(initial.securityRules()),
+                List.of()));
         for (DecisionReason r : List.of(DecisionReason.SQL_INJECTION, DecisionReason.XSS,
                 DecisionReason.COMMAND_INJECTION, DecisionReason.PATH_TRAVERSAL,
                 DecisionReason.SUSPICIOUS_ENCODING)) {
@@ -85,7 +90,8 @@ public class TrafficShieldService {
 
             ShieldDecision decision;
             if (properties.isEnabled()) {
-                SecurityInspector.Hit hit = inspector.inspect(snapshot.compiledSecurity(), request);
+                SecurityInspector.Hit hit = inspector.inspect(snapshot.compiledSecurity(),
+                        snapshot.compiledExceptions(), request);
                 if (hit != null) {
                     decision = ShieldDecision.reject(hit.reason(), hit.ruleId(),
                             hit.detail(), version, request.source(), request.path());
@@ -95,7 +101,8 @@ public class TrafficShieldService {
                 }
             }
 
-            RateLimiter.Denied denied = rateLimiter.tryAcquire(snapshot.set().rateLimitRules(),
+            RateLimiter.Denied denied = rateLimiter.tryAcquire(snapshot.set().tierRules(),
+                    snapshot.set().rateLimitRules(),
                     request.source(), request.path(), System.currentTimeMillis());
             if (denied != null) {
                 decision = ShieldDecision.rateLimited(denied.ruleId(),
@@ -125,7 +132,8 @@ public class TrafficShieldService {
 
     /**
      * 原子更新规则。字段为 null 表示该部分保持不变；非 null 表示整表替换。
-     * 新表中任何一条规则非法都会拒绝整个更新并保留旧规则。
+     * 四个部分（安全规则/限流规则/分级档位/误拦例外）中任何一条非法都会
+     * 拒绝整个更新并保留旧规则。
      *
      * @return 更新后生效的规则版本
      */
@@ -139,14 +147,24 @@ public class TrafficShieldService {
                 request.securityRules() != null ? request.securityRules() : current.set().securityRules();
         List<RateLimitRule> nextRate =
                 request.rateLimitRules() != null ? request.rateLimitRules() : current.set().rateLimitRules();
+        List<SourceTierRule> nextTiers =
+                request.tierRules() != null ? request.tierRules() : current.set().tierRules();
+        List<AllowlistException> nextExceptions =
+                request.allowlistExceptions() != null
+                        ? request.allowlistExceptions() : current.set().allowlistExceptions();
 
         // 先完整校验+编译，任何异常都在发布前抛出
         List<SecurityInspector.CompiledRule> compiled = inspector.compile(nextSecurity);
         validateRateRules(nextRate);
+        validateTierRules(nextTiers);
+        // 例外校验依赖同一次发布的安全规则表（豁免目标必须存在）
+        List<SecurityInspector.CompiledException> compiledExceptions =
+                inspector.compileExceptions(nextExceptions, nextSecurity);
 
         RuleSet nextSet = new RuleSet(List.copyOf(nextSecurity), List.copyOf(nextRate),
+                List.copyOf(nextTiers), List.copyOf(nextExceptions),
                 current.set().version() + 1);
-        ActiveRules next = new ActiveRules(nextSet, compiled);
+        ActiveRules next = new ActiveRules(nextSet, compiled, compiledExceptions);
 
         // 唯一发布点
         statsLock.writeLock().lock();
@@ -155,8 +173,11 @@ public class TrafficShieldService {
         } finally {
             statsLock.writeLock().unlock();
         }
-        log.info("规则已原子更新并生效: securityRules={} rateLimitRules={} version={}",
-                nextSet.securityRules().size(), nextSet.rateLimitRules().size(), nextSet.version());
+        log.info("规则已原子更新并生效: securityRules={} rateLimitRules={} tierRules={} "
+                        + "allowlistExceptions={} version={}",
+                nextSet.securityRules().size(), nextSet.rateLimitRules().size(),
+                nextSet.tierRules().size(), nextSet.allowlistExceptions().size(),
+                nextSet.version());
         return nextSet.version();
     }
 
@@ -188,6 +209,37 @@ public class TrafficShieldService {
         }
     }
 
+    private static void validateTierRules(List<SourceTierRule> tierRules) {
+        if (tierRules == null || tierRules.isEmpty()) {
+            return; // 空列表表示未启用分级，合法
+        }
+        Map<String, SourceTierRule> seen = new LinkedHashMap<>();
+        for (SourceTierRule t : tierRules) {
+            if (t == null) {
+                throw new IllegalRuleException("分级档位不能为 null");
+            }
+            if (t.id() == null || t.id().isBlank()) {
+                throw new IllegalRuleException("分级档位 id 不能为空");
+            }
+            if (seen.containsKey(t.id())) {
+                throw new IllegalRuleException("分级档位 id 重复: " + t.id());
+            }
+            if (t.sourcePattern() == null || t.sourcePattern().isBlank()) {
+                throw new IllegalRuleException("分级档位 [" + t.id() + "] 的 sourcePattern 不能为空");
+            }
+            if (t.pathPattern() == null || t.pathPattern().isBlank()) {
+                throw new IllegalRuleException("分级档位 [" + t.id() + "] 的 pathPattern 不能为空");
+            }
+            if (t.limit() <= 0) {
+                throw new IllegalRuleException("分级档位 [" + t.id() + "] 的 limit 必须为正整数");
+            }
+            if (t.windowSeconds() <= 0) {
+                throw new IllegalRuleException("分级档位 [" + t.id() + "] 的 windowSeconds 必须为正整数");
+            }
+            seen.put(t.id(), t);
+        }
+    }
+
     /**
      * 获取当前生效规则集（不可变）。
      */
@@ -215,7 +267,7 @@ public class TrafficShieldService {
     }
 
     /**
-     * 清理过期限流窗口（由调度任务调用）。
+     * 清理过期窗口并执行状态容量回收（由调度任务调用；与正常判定并发安全）。
      */
     public void sweepWindows() {
         rateLimiter.sweepExpired(System.currentTimeMillis());

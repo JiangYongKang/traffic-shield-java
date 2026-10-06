@@ -12,6 +12,9 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  *   <li>{@code source-header}：从哪个请求头识别来源（取第一个值），
  *       缺省回退到对端地址，JSON 入口可显式传 source；</li>
  *   <li>{@code sweep-interval-seconds}：限流过期窗口的清理间隔。</li>
+ *   <li>{@code max-state-entries}：内存中保留的限流窗口状态数量上限，
+ *       超限先清过期窗口、再按 LRU 回收（活跃窗口移入墓碑区，窗口仍有效时
+ *       再次出现会恢复原计数，不会凭空多放行）。</li>
  * </ul>
  */
 @ConfigurationProperties(prefix = "traffic-shield")
@@ -22,6 +25,7 @@ public class ShieldProperties {
     private int defaultWindowSeconds = 10;
     private String sourceHeader = "X-Forwarded-For";
     private long sweepIntervalSeconds = 10;
+    private int maxStateEntries = 10_000;
 
     public boolean isEnabled() {
         return enabled;
@@ -61,5 +65,13 @@ public class ShieldProperties {
 
     public void setSweepIntervalSeconds(long sweepIntervalSeconds) {
         this.sweepIntervalSeconds = sweepIntervalSeconds;
+    }
+
+    public int getMaxStateEntries() {
+        return maxStateEntries;
+    }
+
+    public void setMaxStateEntries(int maxStateEntries) {
+        this.maxStateEntries = maxStateEntries;
     }
 }
